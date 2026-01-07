@@ -1,101 +1,162 @@
-"""Streamlit app for MediaGuard.
+"""
+Streamlit app for MediaGuard.
 
 Usage:
-  streamlit run app.py --server.port=8000 --server.address=0.0.0.0
+  streamlit run app.py --server.port=$PORT --server.address=0.0.0.0
 """
-import logging
-import io
+
 import os
-from PIL import Image
+import traceback
 import streamlit as st
 
 from modules.ai_analysis import AIAnalysisEngine
 
 
-required_envs = [
-    "AZURE_CONTENT_SAFETY_ENDPOINT",
-    "AZURE_CONTENT_SAFETY_KEY",
-    "AZURE_LANGUAGE_ENDPOINT",
-    "AZURE_LANGUAGE_KEY"
-]
+# ===============================
+# ENV CHECK
+# ===============================
+def env_status():
+    keys = [
+        "AZURE_CONTENT_SAFETY_ENDPOINT",
+        "AZURE_CONTENT_SAFETY_KEY",
+        "AZURE_LANGUAGE_ENDPOINT",
+        "AZURE_LANGUAGE_KEY",
+    ]
+    found = {k: os.getenv(k) for k in keys}
+    missing = [k for k, v in found.items() if not v]
+    return found, missing
 
-missing = [var for var in required_envs if not os.getenv(var)]
-if missing:
-    st.error(f"Missing required environment variables: {', '.join(missing)}")
-    raise SystemExit(f"Missing env vars: {', '.join(missing)}")
-else:
-    st.info("All required environment variables are set.")
 
-# ------------------ Logging ------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ===============================
+# MAIN APP
+# ===============================
+def main():
+    # Azure App Service compatibility
+    os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+    os.environ.setdefault("STREAMLIT_SERVER_ADDRESS", "0.0.0.0")
+    os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
 
-# ------------------ Streamlit Config ------------------
-st.set_page_config(page_title="MediaGuard", layout="centered")
-st.title("MediaGuard — Image & Text Safety Analyzer")
-st.markdown(
-    "Upload an image and optionally enter text. MediaGuard will analyze them "
-    "using Microsoft Azure AI Content Safety and Language models."
-)
+    st.set_page_config(
+        page_title="MediaGuard",
+        page_icon="🛡️",
+        layout="centered",
+    )
 
-# ------------------ Inputs ------------------
-uploader = st.file_uploader(
-    "Choose an image", type=["png", "jpg", "jpeg", "webp", "bmp"]
-)
+    st.title("🛡️ MediaGuard")
+    st.caption("AI-powered image & text safety analysis using Azure AI")
 
-text_input = st.text_area(
-    "Optional text to analyze (max 5000 characters):",
-    placeholder="Enter text here...",
-    height=150,
-)
+    found, missing = env_status()
 
-# ------------------ Analysis ------------------
-if uploader is not None or (text_input and text_input.strip()):
+    if missing:
+        st.warning("Some Azure environment variables are missing:")
+        st.code("\n".join(missing))
+
+    # ===============================
+    # INPUTS
+    # ===============================
+    uploaded_file = st.file_uploader(
+        "Upload an image (optional)",
+        type=["png", "jpg", "jpeg", "bmp", "webp"],
+    )
+
+    text_input = st.text_area(
+        "Paste text to analyze (optional)",
+        height=160,
+        placeholder="Enter any text you want to check for safety risks…",
+    )
+
+    st.markdown("---")
+
+    if not st.button("Analyze"):
+        st.info("Provide at least one input and click **Analyze**.")
+        return
+
+    if not uploaded_file and not text_input.strip():
+        st.error("You must provide either an image, text, or both.")
+        return
+
+    # ===============================
+    # PREPARE INPUTS
+    # ===============================
+    image_bytes = None
+    if uploaded_file:
+        try:
+            uploaded_file.seek(0)
+            image_bytes = uploaded_file.read()
+        except Exception:
+            st.error("Failed to read uploaded image.")
+            return
+
+    # ===============================
+    # RUN ANALYSIS
+    # ===============================
+    engine = AIAnalysisEngine()
+
     try:
-        img_bytes = None
-        image = None
-        if uploader is not None:
-            img_bytes = uploader.read()
-            image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            st.image(image, caption="Uploaded image", use_column_width=True)
-
-        st.info("Sending data to Azure AI for analysis...")
-
-        engine = AIAnalysisEngine()
-        result = engine.analyze(img_bytes if img_bytes else None, text_input.strip() if text_input else None)
-
-        # ------------------ Result Handling ------------------
-        if result.get("classification") == "analysis_failed":
-            st.error("Analysis failed: " + result.get("error", "Unknown error"))
-            st.json(result)
-        else:
-            st.success(
-                f"Classification: {result['classification']} — Risk: {result['risk']} — Confidence: {result['confidence']}"
+        with st.spinner("Analyzing content…"):
+            result = engine.analyze(
+                image_bytes=image_bytes,
+                text=text_input.strip() or None,
             )
+    except Exception:
+        st.error("Unexpected error during analysis")
+        st.text(traceback.format_exc())
+        return
 
-            # Provider
-            st.subheader("Provider")
-            st.write(result.get("provider"))
+    # ===============================
+    # HANDLE FAILURE
+    # ===============================
+    if result.get("classification") == "analysis_failed":
+        st.error("Analysis failed")
+        st.code(result.get("error", "Unknown error"))
+        return
 
-            # Image categories breakdown
-            if "categories" in result:
-                st.subheader("Image Category Breakdown")
-                st.json(result["categories"])
+    # ===============================
+    # DISPLAY INPUTS
+    # ===============================
+    st.markdown("## Inputs")
 
-            # Text sentiment analysis
-            if "text_analysis" in result:
-                st.subheader("Text Sentiment Analysis")
-                st.json(result["text_analysis"])
+    if uploaded_file:
+        st.image(uploaded_file, use_column_width=True)
+    else:
+        st.info("No image provided")
 
-            # Full raw response
-            st.subheader("Full Response")
-            st.json(result)
+    if text_input.strip():
+        st.markdown("**Text:**")
+        st.write(text_input)
+    else:
+        st.info("No text provided")
 
-    except Exception as e:
-        logger.exception("Unhandled error in app during analysis")
-        st.error("Unexpected error: " + str(e))
+    # ===============================
+    # SUMMARY
+    # ===============================
+    st.markdown("---")
+    st.markdown("## 🧠 Analysis Summary")
 
-else:
-    st.info("Upload an image or enter text to begin analysis.")
+    st.metric(
+        label="Overall Risk",
+        value=f"{int(result['risk'] * 100)}%",
+    )
+
+    st.write("**Classification:**", result["classification"])
+
+    # ===============================
+    # CATEGORY BREAKDOWN
+    # ===============================
+    st.markdown("---")
+    st.markdown("## 📊 Category Breakdown")
+
+    if result.get("categories"):
+        st.json(result["categories"])
+    else:
+        st.info("No category data available")
+
+    # ===============================
+    # RAW DEBUG (OPTIONAL)
+    # ===============================
+    with st.expander("🔍 Full Raw Response"):
+        st.json(result)
 
 
+if __name__ == "__main__":
+    main()
