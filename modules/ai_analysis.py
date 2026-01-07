@@ -1,15 +1,18 @@
 """
 AI analysis engine for MediaGuard.
 
-- Image analysis via Azure Content Safety
-- Text analysis via Azure Language
-- Fully defensive: never returns None risk
+Uses Azure Content Safety for:
+- Image moderation
+- Text moderation
+
+Both inputs are optional.
+Severity (0–4) is normalized to risk (0.0–1.0).
 """
 
 import os
 import logging
 import mimetypes
-from typing import Optional, Dict, Any
+from typing import Optional, Any, Dict
 
 import requests
 
@@ -17,151 +20,188 @@ logger = logging.getLogger(__name__)
 
 
 class AIAnalysisEngine:
-    def __init__(self):
-        self.content_safety_endpoint = os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT")
-        self.content_safety_key = os.getenv("AZURE_CONTENT_SAFETY_KEY")
-        self.language_endpoint = os.getenv("AZURE_LANGUAGE_ENDPOINT")
-        self.language_key = os.getenv("AZURE_LANGUAGE_KEY")
+    def __init__(
+        self,
+        content_safety_endpoint: Optional[str] = None,
+        content_safety_key: Optional[str] = None,
+    ):
+        self.endpoint = (
+            content_safety_endpoint
+            or os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT")
+        )
+        self.key = (
+            content_safety_key
+            or os.getenv("AZURE_CONTENT_SAFETY_KEY")
+        )
 
-    # =========================
-    # PUBLIC ENTRY
-    # =========================
+    # ---------------------------
+    # PUBLIC ENTRY POINT
+    # ---------------------------
     def analyze(
         self,
-        image_bytes: Optional[bytes] = None,
+        image: Optional[Any] = None,
         text: Optional[str] = None,
     ) -> Dict[str, Any]:
 
-        image_risk = 0.0
-        text_risk = 0.0
-        categories = {}
-
-        # ---------- IMAGE ----------
-        if image_bytes:
-            img = self._analyze_image(image_bytes)
-            image_risk = float(img.get("risk", 0.0))
-            categories.update(img.get("categories", {}))
-
-        # ---------- TEXT ----------
-        if text:
-            txt = self._analyze_text(text)
-            text_risk = float(txt.get("risk", 0.0))
-            categories.update(txt.get("categories", {}))
-
-        # ---------- FINAL ----------
-        final_risk = max(image_risk, text_risk)
-        final_risk = self._clamp(final_risk)
-
-        return {
-            "risk": final_risk,
-            "classification": self._classify(final_risk),
-            "categories": categories,
+        result = {
+            "analysis_failed": False,
+            "error": None,
+            "image": None,
+            "text": None,
+            "final_risk": 0.0,
+            "risk_percentage": 0.0,
+            "classification": "unknown",
         }
 
-    # =========================
-    # IMAGE ANALYSIS
-    # =========================
-    def _analyze_image(self, image_bytes: bytes) -> Dict[str, Any]:
-        if not self.content_safety_endpoint or not self.content_safety_key:
-            return {"risk": 0.0, "categories": {}}
+        if image is None and not text:
+            return {
+                **result,
+                "analysis_failed": True,
+                "error": "No image or text provided",
+            }
 
-        headers = {
-            "Ocp-Apim-Subscription-Key": self.content_safety_key,
-        }
-
-        files = {
-            "file": ("image.jpg", image_bytes, "image/jpeg"),
-        }
+        risks = []
 
         try:
-            r = requests.post(
-                self.content_safety_endpoint,
-                headers=headers,
-                files=files,
-                timeout=30,
-            )
-            r.raise_for_status()
-            data = r.json()
+            if image is not None:
+                img_res = self._analyze_image(image)
+                result["image"] = img_res
+                if not img_res["analysis_failed"]:
+                    risks.append(img_res["risk"])
+
+            if text:
+                txt_res = self._analyze_text(text)
+                result["text"] = txt_res
+                if not txt_res["analysis_failed"]:
+                    risks.append(txt_res["risk"])
+
+            max_risk = max(risks) if risks else 0.0
+
+            result["final_risk"] = float(max_risk)
+            result["risk_percentage"] = round(max_risk * 100, 2)
+            result["classification"] = self._classify(max_risk)
+
         except Exception as e:
-            logger.warning("Image analysis failed: %s", e)
-            return {"risk": 0.0, "categories": {}}
+            logger.exception("Fatal analysis error")
+            result["analysis_failed"] = True
+            result["error"] = str(e)
 
-        categories = data.get("categories", {})
-        risk = self._extract_max_score(categories)
+        return result
 
-        return {
-            "risk": risk,
-            "categories": categories,
-        }
+    # ---------------------------
+    # IMAGE MODERATION
+    # ---------------------------
+    def _analyze_image(self, image: Any) -> Dict[str, Any]:
+        if not self.endpoint or not self.key:
+            return self._fail("Missing Content Safety credentials")
 
-    # =========================
-    # TEXT ANALYSIS
-    # =========================
+        try:
+            filename = "image"
+            content_type = "image/jpeg"
+
+            if isinstance(image, (bytes, bytearray)):
+                image_bytes = image
+            elif hasattr(image, "read"):
+                image.seek(0)
+                image_bytes = image.read()
+                filename = getattr(image, "name", filename)
+                content_type = getattr(image, "type", None) or content_type
+            else:
+                return self._fail("Unsupported image input")
+
+            url = f"{self.endpoint}/contentsafety/image:analyze?api-version=2023-10-01"
+
+            headers = {
+                "Ocp-Apim-Subscription-Key": self.key,
+            }
+
+            files = {
+                "file": (filename, image_bytes, content_type),
+            }
+
+            resp = requests.post(url, headers=headers, files=files, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+        except Exception as e:
+            logger.exception("Image moderation failed")
+            return self._fail(str(e))
+
+        return self._parse_content_safety(data)
+
+    # ---------------------------
+    # TEXT MODERATION (FIXED)
+    # ---------------------------
     def _analyze_text(self, text: str) -> Dict[str, Any]:
-        if not self.language_endpoint or not self.language_key:
-            return {"risk": 0.0, "categories": {}}
+        if not self.endpoint or not self.key:
+            return self._fail("Missing Content Safety credentials")
+
+        text = text.strip()
+        if not text:
+            return self._fail("Empty text input")
+
+        url = f"{self.endpoint}/contentsafety/text:analyze?api-version=2023-10-01"
 
         payload = {
-            "documents": [
-                {"id": "1", "language": "en", "text": text[:5000]}
-            ]
+            "text": text,
+            "categories": ["Sexual", "Violence", "Hate", "SelfHarm"],
         }
 
         headers = {
-            "Ocp-Apim-Subscription-Key": self.language_key,
+            "Ocp-Apim-Subscription-Key": self.key,
             "Content-Type": "application/json",
         }
 
         try:
-            r = requests.post(
-                self.language_endpoint,
-                headers=headers,
-                json=payload,
-                timeout=30,
-            )
-            r.raise_for_status()
-            data = r.json()
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
         except Exception as e:
-            logger.warning("Text analysis failed: %s", e)
-            return {"risk": 0.0, "categories": {}}
+            logger.exception("Text moderation failed")
+            return self._fail(str(e))
 
-        docs = data.get("documents", [])
-        if not docs:
-            return {"risk": 0.0, "categories": {}}
+        return self._parse_content_safety(data)
 
-        scores = docs[0].get("confidenceScores", {})
-        negative = scores.get("negative", 0.0)
+    # ---------------------------
+    # SHARED PARSER
+    # ---------------------------
+    def _parse_content_safety(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        categories = {}
+        max_severity = 0
+
+        for item in data.get("categoriesAnalysis", []):
+            name = item.get("category")
+            severity = item.get("severity", 0)
+            categories[name.lower()] = severity
+            max_severity = max(max_severity, severity)
+
+        risk = max_severity / 4.0  # normalize 0–4 → 0.0–1.0
 
         return {
-            "risk": self._clamp(negative),
-            "categories": {"negative_sentiment": negative},
+            "analysis_failed": False,
+            "raw": data,
+            "categories": categories,
+            "risk": round(risk, 3),
+            "confidence": round(risk, 3),
         }
 
-    # =========================
+    # ---------------------------
     # HELPERS
-    # =========================
-    @staticmethod
-    def _extract_max_score(categories: Dict[str, Any]) -> float:
-        values = []
-        for v in categories.values():
-            if isinstance(v, dict):
-                values.extend(v.values())
-            elif isinstance(v, (int, float)):
-                values.append(v)
-        return AIAnalysisEngine._clamp(max(values) if values else 0.0)
-
-    @staticmethod
-    def _clamp(value: Any) -> float:
-        try:
-            v = float(value)
-        except Exception:
-            return 0.0
-        return max(0.0, min(1.0, v))
-
+    # ---------------------------
     @staticmethod
     def _classify(risk: float) -> str:
         if risk >= 0.7:
             return "unsafe"
-        if risk >= 0.3:
+        if risk >= 0.4:
             return "sensitive"
         return "safe"
+
+    @staticmethod
+    def _fail(msg: str) -> Dict[str, Any]:
+        return {
+            "analysis_failed": True,
+            "error": msg,
+            "risk": 0.0,
+            "confidence": 0.0,
+            "categories": {},
+        }
