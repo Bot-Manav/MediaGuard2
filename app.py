@@ -10,6 +10,21 @@ import streamlit as st
 
 from modules.ai_analysis import AIAnalysisEngine
 
+
+required_envs = [
+    "AZURE_CONTENT_SAFETY_ENDPOINT",
+    "AZURE_CONTENT_SAFETY_KEY",
+    "AZURE_LANGUAGE_ENDPOINT",
+    "AZURE_LANGUAGE_KEY"
+]
+
+missing = [var for var in required_envs if not os.getenv(var)]
+if missing:
+    st.error(f"Missing required environment variables: {', '.join(missing)}")
+    raise SystemExit(f"Missing env vars: {', '.join(missing)}")
+else:
+    st.info("All required environment variables are set.")
+
 # ------------------ Logging ------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -81,3 +96,4 @@ if uploader is not None or (text_input and text_input.strip()):
 
 else:
     st.info("Upload an image or enter text to begin analysis.")
+
