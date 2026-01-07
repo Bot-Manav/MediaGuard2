@@ -1,284 +1,61 @@
-"""AI analysis engine for MediaGuard.
-
-All inference comes from Azure AI JSON responses. No local models or heuristics.
-Integrates Azure AI Content Safety for images and Azure AI Language for text sentiment.
-"""
-from __future__ import annotations
-
-import json
-import logging
 import os
-from typing import Any, Dict, Optional
+import time
 import requests
-
-from .utils import image_to_bytes, require_env
-
-logger = logging.getLogger(__name__)
+from typing import Dict, Any
 
 
 class AIAnalysisEngine:
-    """Analyze images and text using Microsoft Azure AI services.
+    def __init__(self):
+        self.content_safety_endpoint = os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT")
+        self.content_safety_key = os.getenv("AZURE_CONTENT_SAFETY_KEY")
+        self.language_endpoint = os.getenv("AZURE_LANGUAGE_ENDPOINT")
+        self.language_key = os.getenv("AZURE_LANGUAGE_KEY")
 
-    Image Analysis: Azure Content Safety
-    Endpoint: POST {AZURE_CONTENT_SAFETY_ENDPOINT}/contentsafety/image:analyze?api-version=2023-10-01
-    Response: {"categoriesAnalysis": [{"category":"Violence","severity":0-6}, ...]}
+    # ===============================
+    # PUBLIC ENTRY POINT
+    # ===============================
+    def analyze(self, image_bytes: bytes = None, text: str = None) -> Dict[str, Any]:
+        results = []
 
-        Text Sentiment: Azure AI Language (async job)
-        Endpoint: POST {AZURE_LANGUAGE_ENDPOINT}/language/analyze-text/jobs?api-version=2023-10-01-preview
-        Response (jobs):
-        {
-            "tasks": {
-                "items": [
-                    {
-                        "results": {
-                            "documents": [ {"sentiment": "positive|negative|neutral|mixed"} ]
-                        }
-                    }
-                ]
-            }
-        }
-
-    Final risk score = max(image_risk, text_risk)
-    On any API/schema error the engine returns an `analysis_failed` response.
-    """
-
-    PROVIDER = "Microsoft Azure AI"
-
-    # Map Azure category names (case-insensitive) to our output keys
-    CATEGORY_MAP = {
-        "violence": "violence",
-        "sexual": "sexual",
-        "selfharm": "self_harm",
-        "self_harm": "self_harm",
-        "hate": "hate",
-    }
-
-    MAX_SEVERITY = 6.0
-
-    # Sentiment to risk mapping
-    SENTIMENT_RISK_MAP = {
-        "negative": 0.6,
-        "mixed": 0.4,
-        "neutral": 0.0,
-        "positive": 0.0,
-    }
-
-    def __init__(self) -> None:
-        # Azure Content Safety credentials
-        self.content_safety_endpoint = require_env("AZURE_CONTENT_SAFETY_ENDPOINT").rstrip("/")
-        self.content_safety_key = require_env("AZURE_CONTENT_SAFETY_KEY")
-
-        # Azure Language credentials
-        self.language_endpoint = require_env("AZURE_LANGUAGE_ENDPOINT").rstrip("/")
-        self.language_key = require_env("AZURE_LANGUAGE_KEY")
-
-        # Optional Content Safety region header
-        self.content_safety_region = os.getenv("AZURE_CONTENT_SAFETY_REGION")
-
-        # Build full endpoints
-        self.image_endpoint = f"{self.content_safety_endpoint}/contentsafety/image:analyze?api-version=2023-10-01"
-        # use jobs path for async responses
-        self.text_endpoint = f"{self.language_endpoint}/language/analyze-text/jobs?api-version=2023-10-01-preview"
-
-    def analyze(self, image, text: Optional[str] = None) -> Dict[str, Any]:
-        """Analyze image and optional text using Azure AI services.
-        
-        Args:
-            image: Image data (file path, bytes, or file-like object)
-            text: Optional text content for sentiment analysis
-            
-        Returns:
-            Analysis result with classification, risk score, and detailed breakdown
-        """
-        # Analyze image with Azure Content Safety
-        image_result = self._analyze_image(image)
-
-        # If image analysis failed, return early
-        if image_result.get("classification") == "analysis_failed":
-            return image_result
-
-        # Get image risk score (0.0-1.0)
-        image_risk = float(image_result.get("confidence", 0.0))
-        
-        # Analyze text if provided
-        text_analysis = None
-        text_risk = 0.0
-        
         if text:
-            text_result = self._analyze_text(text)
-            # If text analysis failed, log and continue with image-only risk
-            if text_result.get("classification") == "analysis_failed":
-                logger.warning("Text analysis failed: %s", text_result.get("error"))
-            elif text_result.get("status") == "ok":
-                try:
-                    sentiment = text_result["sentiment"]
-                    risk_val = float(text_result["risk"])
-                    text_analysis = {"sentiment": sentiment, "risk": risk_val}
-                    text_risk = risk_val
-                except Exception:
-                    logger.exception("Malformed text analysis result")
-            else:
-                logger.error("Unexpected text analysis response: %s", json.dumps(text_result)[:800])
-        
-        # Fusion logic: final risk = max(image_risk, text_risk)
-        final_risk = max(image_risk, text_risk)
-        final_classification = self._score_to_classification(final_risk)
+            results.append(self._analyze_text(text))
 
-        # Confidence decreases as risk increases
-        confidence = round(1.0 - float(final_risk), 2)
+        if image_bytes:
+            results.append(self._analyze_image(image_bytes))
 
-        # Build final result
-        result = {
-            "classification": final_classification,
-            "confidence": confidence,
-            "risk": int(round(final_risk * 100)),
-            "provider": self.PROVIDER,
-            "categories": image_result["categories"],
-        }
-        
-        # Include text analysis if available
-        if text_analysis:
-            result["text_analysis"] = text_analysis
-        
-        return result
+        if not results:
+            return self._fail("No input provided")
 
-    def _analyze_image(self, image) -> Dict[str, Any]:
-        """Analyze image using Azure Content Safety."""
-        try:
-            payload = image_to_bytes(image)
-        except Exception as e:
-            logger.exception("Failed converting image to bytes")
-            return {
-                "classification": "analysis_failed",
-                "confidence": 0,
-                "risk": None,
-                "error": f"Image conversion failed: {str(e)}",
-                "categories": {"violence": 0.0, "sexual": 0.0, "self_harm": 0.0, "hate": 0.0},
-            }
+        if any(r.get("analysis_failed") for r in results):
+            return next(r for r in results if r.get("analysis_failed"))
 
-        headers = {
-            "Ocp-Apim-Subscription-Key": self.content_safety_key,
-            "Content-Type": "application/octet-stream",
-        }
-        # Optional region header
-        if self.content_safety_region:
-            headers["Ocp-Apim-Subscription-Region"] = self.content_safety_region
+        max_risk = max(r["risk"] for r in results)
+        merged_categories = {}
 
-        try:
-            resp = requests.post(self.image_endpoint, data=payload, headers=headers, timeout=30)
-        except requests.RequestException:
-            logger.exception("Azure Content Safety request failed")
-            return {
-                "classification": "analysis_failed",
-                "confidence": 0,
-                "risk": None,
-                "error": "Azure Content Safety request failed",
-                "categories": {"violence": 0.0, "sexual": 0.0, "self_harm": 0.0, "hate": 0.0},
-            }
-
-        if resp.status_code != 200:
-            logger.error("Azure Content Safety returned non-200: %s %s", resp.status_code, resp.text[:400])
-            return {
-                "classification": "analysis_failed",
-                "confidence": 0,
-                "risk": None,
-                "error": f"Azure Content Safety request failed: status={resp.status_code}",
-                "categories": {"violence": 0.0, "sexual": 0.0, "self_harm": 0.0, "hate": 0.0},
-            }
-
-        try:
-            data = resp.json()
-        except ValueError:
-            logger.exception("Azure Content Safety returned non-JSON response")
-            return {
-                "classification": "analysis_failed",
-                "confidence": 0,
-                "risk": None,
-                "error": "Invalid Azure Content Safety response: not JSON",
-                "categories": {"violence": 0.0, "sexual": 0.0, "self_harm": 0.0, "hate": 0.0},
-            }
-
-        # Parse categoriesAnalysis array
-        categories_raw = (data.get("categoriesAnalysis") or data.get("categories_analysis"))
-        if not isinstance(categories_raw, list):
-            logger.error("Missing or invalid 'categoriesAnalysis' in response: %s", json.dumps(data)[:800])
-            return {
-                "classification": "analysis_failed",
-                "confidence": 0,
-                "risk": None,
-                "error": "Invalid Azure Content Safety response",
-                "categories": {"violence": 0.0, "sexual": 0.0, "self_harm": 0.0, "hate": 0.0},
-            }
-
-        parsed: Dict[str, float] = {"violence": 0.0, "sexual": 0.0, "self_harm": 0.0, "hate": 0.0}
-
-        valid_found = False
-        for item in categories_raw:
-            if not isinstance(item, dict):
-                continue
-            cat = item.get("category")
-            sev = item.get("severity")
-            if not isinstance(cat, str):
-                continue
-            # normalize category token
-            key = cat.replace(" ", "").lower()
-            mapped = self.CATEGORY_MAP.get(key)
-            if mapped is None:
-                continue
-            # severity must be numeric between 0 and MAX_SEVERITY
-            try:
-                sev_f = float(sev)
-            except (TypeError, ValueError):
-                logger.error("Non-numeric severity for category %s: %s", cat, sev)
-                return {
-                    "classification": "analysis_failed",
-                    "confidence": 0,
-                    "risk": None,
-                    "error": "Invalid Azure Content Safety response",
-                    "categories": {"violence": 0.0, "sexual": 0.0, "self_harm": 0.0, "hate": 0.0},
-                }
-            if not (0.0 <= sev_f <= self.MAX_SEVERITY):
-                logger.error("Severity out of range for category %s: %s", cat, sev_f)
-                return {
-                    "classification": "analysis_failed",
-                    "confidence": 0,
-                    "risk": None,
-                    "error": "Invalid Azure Content Safety response",
-                    "categories": {"violence": 0.0, "sexual": 0.0, "self_harm": 0.0, "hate": 0.0},
-                }
-
-            # normalize to 0..1
-            norm = sev_f / self.MAX_SEVERITY
-            parsed[mapped] = round(norm, 3)
-            valid_found = True
-
-        if not valid_found:
-            logger.error("No valid category severities found in response: %s", json.dumps(data)[:800])
-            return {
-                "classification": "analysis_failed",
-                "confidence": 0,
-                "risk": None,
-                "error": "Invalid Azure Content Safety response",
-                "categories": {"violence": 0.0, "sexual": 0.0, "self_harm": 0.0, "hate": 0.0},
-            }
-
-        # compute max normalized score
-        max_score = max(parsed.values())
+        for r in results:
+            for k, v in r["categories"].items():
+                merged_categories[k] = max(merged_categories.get(k, 0), v)
 
         return {
-            "status": "ok",
-            "confidence": max_score,
-            "categories": parsed,
+            "classification": self._classify(max_risk),
+            "risk": round(max_risk, 3),
+            "confidence": round(max_risk, 3),
+            "categories": merged_categories,
+            "provider": "Azure AI Content Safety",
+            "raw": results,
         }
 
+    # ===============================
+    # TEXT ANALYSIS
+    # ===============================
     def _analyze_text(self, text: str) -> Dict[str, Any]:
-        """Analyze text sentiment using Azure AI Language."""
-        if not text or not text.strip():
-            logger.warning("Empty text provided for sentiment analysis")
-            return {
-                "classification": "analysis_failed",
-                "error": "Empty text",
-            }
+        if not self.language_endpoint or not self.language_key:
+            return self._fail("Azure Language credentials missing")
+
+        submit_url = (
+            self.language_endpoint.rstrip("/")
+            + "/language/analyze-text/jobs?api-version=2023-10-01"
+        )
 
         headers = {
             "Ocp-Apim-Subscription-Key": self.language_key,
@@ -286,85 +63,111 @@ class AIAnalysisEngine:
         }
 
         payload = {
-            "kind": "SentimentAnalysis",
-            "parameters": {"modelVersion": "latest"},
+            "kind": "ContentSafety",
             "analysisInput": {
-                "documents": [
-                    {"id": "1", "language": "en", "text": text[:5000]}
-                ]
-            }
+                "documents": [{"id": "1", "language": "en", "text": text}]
+            },
         }
 
         try:
-            resp = requests.post(self.text_endpoint, json=payload, headers=headers, timeout=30)
-        except requests.RequestException:
-            logger.exception("Azure AI Language request failed")
-            return {
-                "classification": "analysis_failed",
-                "error": "Azure AI Language request failed",
-            }
+            submit = requests.post(submit_url, headers=headers, json=payload)
+            submit.raise_for_status()
+            job_url = submit.headers["operation-location"]
 
-        if resp.status_code != 200:
-            logger.error("Azure AI Language returned non-200: %s %s", resp.status_code, resp.text[:400])
-            return {
-                "classification": "analysis_failed",
-                "error": f"Azure AI Language request failed: status={resp.status_code}",
-            }
+            for _ in range(10):
+                time.sleep(1)
+                poll = requests.get(
+                    job_url,
+                    headers={"Ocp-Apim-Subscription-Key": self.language_key},
+                )
+                poll.raise_for_status()
+                data = poll.json()
 
-        try:
-            data = resp.json()
-        except ValueError:
-            logger.exception("Azure AI Language returned non-JSON response")
-            return {
-                "classification": "analysis_failed",
-                "error": "Invalid Azure AI Language response: not JSON",
-            }
-
-        # Parse async job response: tasks.items[].results.documents
-        try:
-            tasks = data.get("tasks") if isinstance(data, dict) else None
-            if not tasks or not isinstance(tasks, dict):
-                logger.error("Missing 'tasks' in language response: %s", json.dumps(data)[:800])
-                return {"classification": "analysis_failed", "error": "Invalid Azure AI Language response"}
-
-            items = tasks.get("items")
-            if not items or not isinstance(items, list) or len(items) == 0:
-                logger.error("Missing 'tasks.items' in language response: %s", json.dumps(data)[:800])
-                return {"classification": "analysis_failed", "error": "Invalid Azure AI Language response"}
-
-            # find first item with results.documents
-            doc_list = None
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                results = it.get("results")
-                if not results or not isinstance(results, dict):
-                    continue
-                documents = results.get("documents")
-                if documents and isinstance(documents, list) and len(documents) > 0:
-                    doc_list = documents
+                if data["status"] == "succeeded":
                     break
+            else:
+                return self._fail("Text analysis timed out")
 
-            if not doc_list:
-                logger.error("No documents found in language task results: %s", json.dumps(data)[:800])
-                return {"classification": "analysis_failed", "error": "Invalid Azure AI Language response"}
+            analysis = data["results"]["documents"][0]["contentSafety"]
 
-            document = doc_list[0]
-            sentiment = (document.get("sentiment") or "").lower()
-            if sentiment not in self.SENTIMENT_RISK_MAP:
-                logger.error("Unknown sentiment value: %s", sentiment)
-                return {"classification": "analysis_failed", "error": "Invalid Azure AI Language response"}
+        except Exception as e:
+            return self._fail(f"Text analysis failed: {e}")
 
-            risk = self.SENTIMENT_RISK_MAP[sentiment]
-            return {"status": "ok", "sentiment": sentiment, "risk": risk}
+        categories = {}
+        max_severity = 0.0
 
-        except Exception:
-            logger.exception("Error parsing Azure AI Language job response")
-            return {"classification": "analysis_failed", "error": "Invalid Azure AI Language response"}
+        for name, info in analysis.items():
+            sev = float(info.get("severity", 0))
+            categories[name.lower()] = round(sev / 6.0, 3)
+            max_severity = max(max_severity, sev)
 
-    def _score_to_classification(self, score: float) -> str:
-        if score <= 0.2:
-            return "safe"
-        if score <= 0.6:
-            return "sensitive"
-        return "unsafe"
+        risk = max_severity / 6.0
+
+        return {
+            "risk": round(risk, 3),
+            "categories": categories,
+        }
+
+    # ===============================
+    # IMAGE ANALYSIS
+    # ===============================
+    def _analyze_image(self, image_bytes: bytes) -> Dict[str, Any]:
+        if not self.content_safety_endpoint or not self.content_safety_key:
+            return self._fail("Azure Content Safety credentials missing")
+
+        url = (
+            self.content_safety_endpoint.rstrip("/")
+            + "/contentsafety/image:analyze?api-version=2023-10-01"
+        )
+
+        headers = {
+            "Ocp-Apim-Subscription-Key": self.content_safety_key,
+            "Content-Type": "application/octet-stream",
+        }
+
+        try:
+            resp = requests.post(url, headers=headers, data=image_bytes, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            return self._fail(f"Image analysis failed: {e}")
+
+        categories = {}
+        max_severity = 0.0
+
+        for item in data.get("categoriesAnalysis", []):
+            sev = float(item.get("severity", 0))
+            cat = item.get("category", "").lower().replace(" ", "_")
+            categories[cat] = round(sev / 6.0, 3)
+            max_severity = max(max_severity, sev)
+
+        risk = max_severity / 6.0
+
+        return {
+            "risk": round(risk, 3),
+            "categories": categories,
+        }
+
+    # ===============================
+    # HELPERS
+    # ===============================
+    def _classify(self, risk: float) -> str:
+        if risk >= 0.7:
+            return "high_risk"
+        if risk >= 0.4:
+            return "medium_risk"
+        return "low_risk"
+
+    def _fail(self, msg: str) -> Dict[str, Any]:
+        return {
+            "classification": "analysis_failed",
+            "confidence": 0,
+            "risk": None,
+            "error": msg,
+            "categories": {
+                "violence": 0,
+                "sexual": 0,
+                "self_harm": 0,
+                "hate": 0,
+            },
+        }
