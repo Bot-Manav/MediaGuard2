@@ -1,7 +1,19 @@
+"""
+AI analysis engine for MediaGuard.
+
+- Image analysis via Azure Content Safety
+- Text analysis via Azure Language
+- Fully defensive: never returns None risk
+"""
+
 import os
-import time
+import logging
+import mimetypes
+from typing import Optional, Dict, Any
+
 import requests
-from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
 
 
 class AIAnalysisEngine:
@@ -11,163 +23,145 @@ class AIAnalysisEngine:
         self.language_endpoint = os.getenv("AZURE_LANGUAGE_ENDPOINT")
         self.language_key = os.getenv("AZURE_LANGUAGE_KEY")
 
-    # ===============================
-    # PUBLIC ENTRY POINT
-    # ===============================
-    def analyze(self, image_bytes: bytes = None, text: str = None) -> Dict[str, Any]:
-        results = []
+    # =========================
+    # PUBLIC ENTRY
+    # =========================
+    def analyze(
+        self,
+        image_bytes: Optional[bytes] = None,
+        text: Optional[str] = None,
+    ) -> Dict[str, Any]:
 
-        if text:
-            results.append(self._analyze_text(text))
+        image_risk = 0.0
+        text_risk = 0.0
+        categories = {}
 
+        # ---------- IMAGE ----------
         if image_bytes:
-            results.append(self._analyze_image(image_bytes))
+            img = self._analyze_image(image_bytes)
+            image_risk = float(img.get("risk", 0.0))
+            categories.update(img.get("categories", {}))
 
-        if not results:
-            return self._fail("No input provided")
+        # ---------- TEXT ----------
+        if text:
+            txt = self._analyze_text(text)
+            text_risk = float(txt.get("risk", 0.0))
+            categories.update(txt.get("categories", {}))
 
-        if any(r.get("analysis_failed") for r in results):
-            return next(r for r in results if r.get("analysis_failed"))
-
-        max_risk = max(r["risk"] for r in results)
-        merged_categories = {}
-
-        for r in results:
-            for k, v in r["categories"].items():
-                merged_categories[k] = max(merged_categories.get(k, 0), v)
+        # ---------- FINAL ----------
+        final_risk = max(image_risk, text_risk)
+        final_risk = self._clamp(final_risk)
 
         return {
-            "classification": self._classify(max_risk),
-            "risk": round(max_risk, 3),
-            "confidence": round(max_risk, 3),
-            "categories": merged_categories,
-            "provider": "Azure AI Content Safety",
-            "raw": results,
+            "risk": final_risk,
+            "classification": self._classify(final_risk),
+            "categories": categories,
         }
 
-    # ===============================
+    # =========================
+    # IMAGE ANALYSIS
+    # =========================
+    def _analyze_image(self, image_bytes: bytes) -> Dict[str, Any]:
+        if not self.content_safety_endpoint or not self.content_safety_key:
+            return {"risk": 0.0, "categories": {}}
+
+        headers = {
+            "Ocp-Apim-Subscription-Key": self.content_safety_key,
+        }
+
+        files = {
+            "file": ("image.jpg", image_bytes, "image/jpeg"),
+        }
+
+        try:
+            r = requests.post(
+                self.content_safety_endpoint,
+                headers=headers,
+                files=files,
+                timeout=30,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            logger.warning("Image analysis failed: %s", e)
+            return {"risk": 0.0, "categories": {}}
+
+        categories = data.get("categories", {})
+        risk = self._extract_max_score(categories)
+
+        return {
+            "risk": risk,
+            "categories": categories,
+        }
+
+    # =========================
     # TEXT ANALYSIS
-    # ===============================
+    # =========================
     def _analyze_text(self, text: str) -> Dict[str, Any]:
         if not self.language_endpoint or not self.language_key:
-            return self._fail("Azure Language credentials missing")
+            return {"risk": 0.0, "categories": {}}
 
-        submit_url = (
-            self.language_endpoint.rstrip("/")
-            + "/language/analyze-text/jobs?api-version=2023-10-01"
-        )
+        payload = {
+            "documents": [
+                {"id": "1", "language": "en", "text": text[:5000]}
+            ]
+        }
 
         headers = {
             "Ocp-Apim-Subscription-Key": self.language_key,
             "Content-Type": "application/json",
         }
 
-        payload = {
-            "kind": "ContentSafety",
-            "analysisInput": {
-                "documents": [{"id": "1", "language": "en", "text": text}]
-            },
-        }
-
         try:
-            submit = requests.post(submit_url, headers=headers, json=payload)
-            submit.raise_for_status()
-            job_url = submit.headers["operation-location"]
-
-            for _ in range(10):
-                time.sleep(1)
-                poll = requests.get(
-                    job_url,
-                    headers={"Ocp-Apim-Subscription-Key": self.language_key},
-                )
-                poll.raise_for_status()
-                data = poll.json()
-
-                if data["status"] == "succeeded":
-                    break
-            else:
-                return self._fail("Text analysis timed out")
-
-            analysis = data["results"]["documents"][0]["contentSafety"]
-
+            r = requests.post(
+                self.language_endpoint,
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+            r.raise_for_status()
+            data = r.json()
         except Exception as e:
-            return self._fail(f"Text analysis failed: {e}")
+            logger.warning("Text analysis failed: %s", e)
+            return {"risk": 0.0, "categories": {}}
 
-        categories = {}
-        max_severity = 0.0
+        docs = data.get("documents", [])
+        if not docs:
+            return {"risk": 0.0, "categories": {}}
 
-        for name, info in analysis.items():
-            sev = float(info.get("severity", 0))
-            categories[name.lower()] = round(sev / 6.0, 3)
-            max_severity = max(max_severity, sev)
-
-        risk = max_severity / 6.0
+        scores = docs[0].get("confidenceScores", {})
+        negative = scores.get("negative", 0.0)
 
         return {
-            "risk": round(risk, 3),
-            "categories": categories,
+            "risk": self._clamp(negative),
+            "categories": {"negative_sentiment": negative},
         }
 
-    # ===============================
-    # IMAGE ANALYSIS
-    # ===============================
-    def _analyze_image(self, image_bytes: bytes) -> Dict[str, Any]:
-        if not self.content_safety_endpoint or not self.content_safety_key:
-            return self._fail("Azure Content Safety credentials missing")
-
-        url = (
-            self.content_safety_endpoint.rstrip("/")
-            + "/contentsafety/image:analyze?api-version=2023-10-01"
-        )
-
-        headers = {
-            "Ocp-Apim-Subscription-Key": self.content_safety_key,
-            "Content-Type": "application/octet-stream",
-        }
-
-        try:
-            resp = requests.post(url, headers=headers, data=image_bytes, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            return self._fail(f"Image analysis failed: {e}")
-
-        categories = {}
-        max_severity = 0.0
-
-        for item in data.get("categoriesAnalysis", []):
-            sev = float(item.get("severity", 0))
-            cat = item.get("category", "").lower().replace(" ", "_")
-            categories[cat] = round(sev / 6.0, 3)
-            max_severity = max(max_severity, sev)
-
-        risk = max_severity / 6.0
-
-        return {
-            "risk": round(risk, 3),
-            "categories": categories,
-        }
-
-    # ===============================
+    # =========================
     # HELPERS
-    # ===============================
-    def _classify(self, risk: float) -> str:
-        if risk >= 0.7:
-            return "high_risk"
-        if risk >= 0.4:
-            return "medium_risk"
-        return "low_risk"
+    # =========================
+    @staticmethod
+    def _extract_max_score(categories: Dict[str, Any]) -> float:
+        values = []
+        for v in categories.values():
+            if isinstance(v, dict):
+                values.extend(v.values())
+            elif isinstance(v, (int, float)):
+                values.append(v)
+        return AIAnalysisEngine._clamp(max(values) if values else 0.0)
 
-    def _fail(self, msg: str) -> Dict[str, Any]:
-        return {
-            "classification": "analysis_failed",
-            "confidence": 0,
-            "risk": None,
-            "error": msg,
-            "categories": {
-                "violence": 0,
-                "sexual": 0,
-                "self_harm": 0,
-                "hate": 0,
-            },
-        }
+    @staticmethod
+    def _clamp(value: Any) -> float:
+        try:
+            v = float(value)
+        except Exception:
+            return 0.0
+        return max(0.0, min(1.0, v))
+
+    @staticmethod
+    def _classify(risk: float) -> str:
+        if risk >= 0.7:
+            return "unsafe"
+        if risk >= 0.3:
+            return "sensitive"
+        return "safe"
