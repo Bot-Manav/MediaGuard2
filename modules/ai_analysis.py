@@ -11,27 +11,25 @@ Severity (0–4) is normalized to risk (0.0–1.0).
 
 import os
 import logging
-from typing import Optional, Any, Dict
 import mimetypes
+import base64
+from typing import Optional, Any, Dict
+
 import requests
 
 logger = logging.getLogger(__name__)
 
 
 class AIAnalysisEngine:
+    """Engine to analyze images and text using Azure Content Safety."""
+
     def __init__(
         self,
         content_safety_endpoint: Optional[str] = None,
         content_safety_key: Optional[str] = None,
     ):
-        self.endpoint = (
-            content_safety_endpoint
-            or os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT")
-        )
-        self.key = (
-            content_safety_key
-            or os.getenv("AZURE_CONTENT_SAFETY_KEY")
-        )
+        self.endpoint = content_safety_endpoint or os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT")
+        self.key = content_safety_key or os.getenv("AZURE_CONTENT_SAFETY_KEY")
 
     # ---------------------------
     # PUBLIC ENTRY POINT
@@ -41,6 +39,7 @@ class AIAnalysisEngine:
         image: Optional[Any] = None,
         text: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Analyze optional image and/or text and return results."""
 
         result = {
             "analysis_failed": False,
@@ -88,43 +87,51 @@ class AIAnalysisEngine:
         return result
 
     # ---------------------------
-    # IMAGE MODERATION
+    # IMAGE MODERATION (BASE64 JSON)
     # ---------------------------
     def _analyze_image(self, image: Any) -> Dict[str, Any]:
         if not self.endpoint or not self.key:
             return self._fail("Missing Content Safety credentials")
 
         try:
-            filename = "image"
-            content_type = "image/jpeg"
-
+            # Read image bytes
             if isinstance(image, (bytes, bytearray)):
                 image_bytes = image
             elif hasattr(image, "read"):
                 image.seek(0)
                 image_bytes = image.read()
-                filename = getattr(image, "name", filename)
-                content_type = getattr(image, "type", None) or content_type
+            elif isinstance(image, str) and os.path.exists(image):
+                with open(image, "rb") as f:
+                    image_bytes = f.read()
             else:
-                return self._fail("Unsupported image input")
+                return self._fail("Unsupported image input type")
+        except Exception as e:
+            return self._fail(f"Failed to read image: {e}")
 
+        if not image_bytes:
+            return self._fail("Empty image provided")
+
+        # Convert to base64
+        try:
+            image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        except Exception as e:
+            return self._fail(f"Failed to encode image to base64: {e}")
+
+        payload = {"input": [{"type": "image", "image_base64": image_b64}]}
+        headers = {
+            "Ocp-Apim-Subscription-Key": self.key,
+            "Content-Type": "application/json",
+        }
+
+        try:
             url = f"{self.endpoint}/contentsafety/image:analyze?api-version=2023-10-01"
-
-            headers = {
-                "Ocp-Apim-Subscription-Key": self.key,
-            }
-
-            files = {
-                "file": (filename, image_bytes, content_type),
-            }
-
-            resp = requests.post(url, headers=headers, files=files, timeout=30)
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
             resp.raise_for_status()
             data = resp.json()
-
-        except Exception as e:
-            logger.exception("Image moderation failed")
-            return self._fail(str(e))
+        except requests.RequestException as e:
+            return self._fail(f"Content Safety request failed: {e}")
+        except ValueError:
+            return self._fail("Invalid JSON response from Content Safety")
 
         return self._parse_content_safety(data)
 
@@ -139,25 +146,21 @@ class AIAnalysisEngine:
         if not text:
             return self._fail("Empty text input")
 
-        url = f"{self.endpoint}/contentsafety/text:analyze?api-version=2023-10-01"
-
-        payload = {
-            "text": text,
-            "categories": ["Sexual", "Violence", "Hate", "SelfHarm"],
-        }
-
+        payload = {"text": text, "categories": ["Sexual", "Violence", "Hate", "SelfHarm"]}
         headers = {
             "Ocp-Apim-Subscription-Key": self.key,
             "Content-Type": "application/json",
         }
 
         try:
+            url = f"{self.endpoint}/contentsafety/text:analyze?api-version=2023-10-01"
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             resp.raise_for_status()
             data = resp.json()
-        except Exception as e:
-            logger.exception("Text moderation failed")
-            return self._fail(str(e))
+        except requests.RequestException as e:
+            return self._fail(f"Text moderation request failed: {e}")
+        except ValueError:
+            return self._fail("Invalid JSON response from Text moderation")
 
         return self._parse_content_safety(data)
 
@@ -171,8 +174,9 @@ class AIAnalysisEngine:
         for item in data.get("categoriesAnalysis", []):
             name = item.get("category")
             severity = item.get("severity", 0)
-            categories[name.lower()] = severity
-            max_severity = max(max_severity, severity)
+            if name:
+                categories[name.lower()] = severity
+                max_severity = max(max_severity, severity)
 
         risk = max_severity / 4.0  # normalize 0–4 → 0.0–1.0
 
