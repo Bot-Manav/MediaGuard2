@@ -5,6 +5,7 @@ Usage:
 """
 import logging
 import io
+import os
 from PIL import Image
 import streamlit as st
 
@@ -96,4 +97,5 @@ if uploader is not None or (text_input and text_input.strip()):
 
 else:
     st.info("Upload an image or enter text to begin analysis.")
+
 
