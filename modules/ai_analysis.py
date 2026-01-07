@@ -11,9 +11,8 @@ Severity (0–4) is normalized to risk (0.0–1.0).
 
 import os
 import logging
-import mimetypes
 from typing import Optional, Any, Dict
-
+import mimetypes
 import requests
 
 logger = logging.getLogger(__name__)
@@ -130,7 +129,7 @@ class AIAnalysisEngine:
         return self._parse_content_safety(data)
 
     # ---------------------------
-    # TEXT MODERATION (FIXED)
+    # TEXT MODERATION
     # ---------------------------
     def _analyze_text(self, text: str) -> Dict[str, Any]:
         if not self.endpoint or not self.key:
