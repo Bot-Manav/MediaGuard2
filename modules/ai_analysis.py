@@ -5,13 +5,11 @@ Uses Azure Content Safety for:
 - Image moderation
 - Text moderation
 
-Both inputs are optional.
 Severity (0–4) is normalized to risk (0.0–1.0).
 """
 
 import os
 import logging
-import mimetypes
 import base64
 from typing import Optional, Any, Dict
 
@@ -21,25 +19,31 @@ logger = logging.getLogger(__name__)
 
 
 class AIAnalysisEngine:
-    """Engine to analyze images and text using Azure Content Safety."""
-
     def __init__(
         self,
         content_safety_endpoint: Optional[str] = None,
         content_safety_key: Optional[str] = None,
     ):
-        self.endpoint = content_safety_endpoint or os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT")
-        self.key = content_safety_key or os.getenv("AZURE_CONTENT_SAFETY_KEY")
+        self.endpoint = (
+            content_safety_endpoint
+            or os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT")
+        )
+        self.key = (
+            content_safety_key
+            or os.getenv("AZURE_CONTENT_SAFETY_KEY")
+        )
+
+        if self.endpoint:
+            self.endpoint = self.endpoint.rstrip("/")
 
     # ---------------------------
-    # PUBLIC ENTRY POINT
+    # PUBLIC ENTRY
     # ---------------------------
     def analyze(
         self,
         image: Optional[Any] = None,
         text: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Analyze optional image and/or text and return results."""
 
         result = {
             "analysis_failed": False,
@@ -52,11 +56,7 @@ class AIAnalysisEngine:
         }
 
         if image is None and not text:
-            return {
-                **result,
-                "analysis_failed": True,
-                "error": "No image or text provided",
-            }
+            return self._fail_global("No image or text provided")
 
         risks = []
 
@@ -74,27 +74,24 @@ class AIAnalysisEngine:
                     risks.append(txt_res["risk"])
 
             max_risk = max(risks) if risks else 0.0
-
-            result["final_risk"] = float(max_risk)
+            result["final_risk"] = max_risk
             result["risk_percentage"] = round(max_risk * 100, 2)
             result["classification"] = self._classify(max_risk)
 
         except Exception as e:
             logger.exception("Fatal analysis error")
-            result["analysis_failed"] = True
-            result["error"] = str(e)
+            return self._fail_global(str(e))
 
         return result
 
     # ---------------------------
-    # IMAGE MODERATION (BASE64 JSON)
+    # IMAGE ANALYSIS (AZURE-CORRECT)
     # ---------------------------
     def _analyze_image(self, image: Any) -> Dict[str, Any]:
         if not self.endpoint or not self.key:
             return self._fail("Missing Content Safety credentials")
 
         try:
-            # Read image bytes
             if isinstance(image, (bytes, bytearray)):
                 image_bytes = image
             elif hasattr(image, "read"):
@@ -111,32 +108,32 @@ class AIAnalysisEngine:
         if not image_bytes:
             return self._fail("Empty image provided")
 
-        # Convert to base64
-        try:
-            image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        except Exception as e:
-            return self._fail(f"Failed to encode image to base64: {e}")
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-        payload = {"input": [{"type": "image", "image_base64": image_b64}]}
+        payload = {
+            "image": {
+                "content": image_b64
+            }
+        }
+
         headers = {
             "Ocp-Apim-Subscription-Key": self.key,
             "Content-Type": "application/json",
         }
 
+        url = f"{self.endpoint}/contentsafety/image:analyze?api-version=2023-10-01"
+
         try:
-            url = f"{self.endpoint}/contentsafety/image:analyze?api-version=2023-10-01"
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             resp.raise_for_status()
-            data = resp.json()
+            return self._parse_content_safety(resp.json())
         except requests.RequestException as e:
-            return self._fail(f"Content Safety request failed: {e}")
+            return self._fail(f"Content Safety image request failed: {e}")
         except ValueError:
-            return self._fail("Invalid JSON response from Content Safety")
-
-        return self._parse_content_safety(data)
+            return self._fail("Invalid JSON response from image moderation")
 
     # ---------------------------
-    # TEXT MODERATION
+    # TEXT ANALYSIS
     # ---------------------------
     def _analyze_text(self, text: str) -> Dict[str, Any]:
         if not self.endpoint or not self.key:
@@ -146,23 +143,23 @@ class AIAnalysisEngine:
         if not text:
             return self._fail("Empty text input")
 
-        payload = {"text": text, "categories": ["Sexual", "Violence", "Hate", "SelfHarm"]}
+        payload = {"text": text}
+
         headers = {
             "Ocp-Apim-Subscription-Key": self.key,
             "Content-Type": "application/json",
         }
 
+        url = f"{self.endpoint}/contentsafety/text:analyze?api-version=2023-10-01"
+
         try:
-            url = f"{self.endpoint}/contentsafety/text:analyze?api-version=2023-10-01"
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             resp.raise_for_status()
-            data = resp.json()
+            return self._parse_content_safety(resp.json())
         except requests.RequestException as e:
-            return self._fail(f"Text moderation request failed: {e}")
+            return self._fail(f"Content Safety text request failed: {e}")
         except ValueError:
-            return self._fail("Invalid JSON response from Text moderation")
-
-        return self._parse_content_safety(data)
+            return self._fail("Invalid JSON response from text moderation")
 
     # ---------------------------
     # SHARED PARSER
@@ -178,7 +175,7 @@ class AIAnalysisEngine:
                 categories[name.lower()] = severity
                 max_severity = max(max_severity, severity)
 
-        risk = max_severity / 4.0  # normalize 0–4 → 0.0–1.0
+        risk = max_severity / 4.0
 
         return {
             "analysis_failed": False,
@@ -207,4 +204,16 @@ class AIAnalysisEngine:
             "risk": 0.0,
             "confidence": 0.0,
             "categories": {},
+        }
+
+    @staticmethod
+    def _fail_global(msg: str) -> Dict[str, Any]:
+        return {
+            "analysis_failed": True,
+            "error": msg,
+            "image": None,
+            "text": None,
+            "final_risk": 0.0,
+            "risk_percentage": 0.0,
+            "classification": "unknown",
         }
