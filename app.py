@@ -1,11 +1,7 @@
 """
 Streamlit app for MediaGuard.
-
-Usage:
-  streamlit run app.py --server.port=8000 --server.address=0.0.0.0
 """
 
-import logging
 import os
 import traceback
 from typing import Optional
@@ -25,40 +21,23 @@ def _env_status():
 
 
 def main():
-    port = os.environ.get("PORT", "8501")
-    os.environ.setdefault("STREAMLIT_SERVER_PORT", port)
-
-    st.set_page_config(page_title="MediaGuard — Image & Text Safety Analyzer")
+    st.set_page_config(page_title="MediaGuard — Content Safety Analyzer")
     st.title("MediaGuard — Image & Text Safety Analyzer")
-    st.write("Upload an image and/or paste text. Both are optional; provide at least one to analyze.")
 
     found, missing = _env_status()
     if missing:
-        st.info("Some environment variables are missing; features depending on them will be disabled.")
-        st.write("Missing:", ", ".join(missing))
+        st.warning("Missing environment variables: " + ", ".join(missing))
 
-    col1, col2 = st.columns([1, 2])
-    uploaded_file: Optional[st.runtime.uploaded_file_manager.UploadedFile] = None
-    text_input: Optional[str] = None
+    uploaded_file = st.file_uploader(
+        "Upload an image (optional)",
+        type=["png", "jpg", "jpeg", "bmp", "webp"]
+    )
 
-    with col1:
-        uploaded_file = st.file_uploader(
-            "Upload an image (optional)",
-            type=["png", "jpg", "jpeg", "bmp", "webp"]
-        )
+    text_input = st.text_area("Optional text to analyze", height=160)
 
-    with col2:
-        text_input = st.text_area("Optional text to analyze", height=160)
-
-    st.markdown("---")
-    analyze = st.button("Analyze")
-
-    if not analyze:
-        st.info("Ready. Provide inputs and click Analyze.")
-
-    if analyze:
+    if st.button("Analyze"):
         if not uploaded_file and not text_input:
-            st.warning("Please provide at least an image or some text to analyze.")
+            st.warning("Provide at least an image or some text.")
             return
 
         engine = AIAnalysisEngine(
@@ -66,80 +45,46 @@ def main():
             content_safety_key=found.get("AZURE_CONTENT_SAFETY_KEY"),
         )
 
-        # Convert uploaded image to bytes
         img_bytes: Optional[bytes] = None
-        if uploaded_file is not None:
-            try:
-                uploaded_file.seek(0)
-                img_bytes = uploaded_file.read()
-            except Exception:
-                st.error("Failed to read uploaded image.")
-                img_bytes = None
+        if uploaded_file:
+            uploaded_file.seek(0)
+            img_bytes = uploaded_file.read()
 
         try:
             with st.spinner("Running analysis..."):
-                result = engine.analyze(image=img_bytes, text=text_input or None)
+                result = engine.analyze(
+                    image=img_bytes,
+                    text=text_input or None
+                )
 
             if result.get("analysis_failed"):
-                st.error("Analysis failed: " + str(result.get("error")))
-                st.expander("Error details").write(result.get("error"))
+                st.error(result.get("error"))
                 return
 
-            # Display inputs
-            st.subheader("Inputs")
-            if uploaded_file:
-                try:
-                    st.image(uploaded_file, use_column_width=True)
-                except Exception:
-                    st.write("(Could not render image preview)")
-            else:
-                st.info("No image provided.")
-
-            if text_input:
-                st.write("**Text provided:**")
-                st.write(text_input)
-            else:
-                st.info("No text provided.")
-
-            # Display results
-            st.markdown("---")
             st.subheader("Summary")
-            st.write(f"**Classification:** {result.get('classification')}")
-            st.write(f"**Risk:** {result.get('risk_percentage')}%")
+            st.write("**Classification:**", result["classification"])
+            st.write("**Risk:**", f"{result['risk_percentage']}%")
 
-            st.markdown("---")
-            st.subheader("Image Analysis")
             if result.get("image"):
-                if result["image"].get("analysis_failed"):
-                    st.error("Image analysis failed: " + str(result["image"].get("error")))
+                st.subheader("Image Analysis")
+                if result["image"]["analysis_failed"]:
+                    st.error(result["image"]["error"])
                 else:
-                    st.write("**Risk:**", f"{round(result['image'].get('risk', 0)*100,2)}%")
-                    st.write("**Confidence:**", f"{round(result['image'].get('confidence', 0)*100,2)}%")
-                    st.write("**Categories:**")
-                    st.json(result["image"].get("categories", {}))
-            else:
-                st.info("No image analysis available.")
+                    st.json(result["image"]["categories"])
 
-            st.markdown("---")
-            st.subheader("Text Analysis")
             if result.get("text"):
-                if result["text"].get("analysis_failed"):
-                    st.error("Text analysis failed: " + str(result["text"].get("error")))
+                st.subheader("Text Analysis")
+                if result["text"]["analysis_failed"]:
+                    st.error(result["text"]["error"])
                 else:
-                    st.write("**Risk:**", f"{round(result['text'].get('risk',0)*100,2)}%")
-                    st.write("**Confidence:**", f"{round(result['text'].get('confidence',0)*100,2)}%")
-                    st.json(result["text"].get("categories", {}))
-            else:
-                st.info("No text analysis available.")
+                    st.json(result["text"]["categories"])
 
-            st.markdown("---")
-            st.subheader("Full Response")
+            st.subheader("Raw Output")
             st.json(result)
 
         except Exception:
-            st.error("Unexpected error while running analysis")
-            with st.expander("Traceback"):
-                st.text(traceback.format_exc())
+            st.error("Unexpected error")
+            st.text(traceback.format_exc())
 
 
 if __name__ == "__main__":
